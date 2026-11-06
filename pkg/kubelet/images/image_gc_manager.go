@@ -338,7 +338,11 @@ func (im *realImageGCManager) handleImageVolumes(ctx context.Context, imagesInUs
 		for _, image := range images {
 			if mount.Image != nil && mount.Image.Image == image.ID {
 				logger.V(5).Info("Container uses image as mount", "pod", klog.KRef(pod.Namespace, pod.Name), "containerName", container.Name, "imageID", image.ID)
-				imagesInUse.Insert(image.ID)
+				if !utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI) {
+					imagesInUse.Insert(image.ID)
+				} else if mount.Image.RuntimeHandler == "" || image.Spec.RuntimeHandler == "" || mount.Image.RuntimeHandler == image.Spec.RuntimeHandler {
+					imagesInUse.Insert(getImageTuple(image.ID, image.Spec.RuntimeHandler))
+				}
 			}
 		}
 	}

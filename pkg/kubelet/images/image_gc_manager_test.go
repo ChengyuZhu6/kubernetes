@@ -28,9 +28,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
+	"k8s.io/apimachinery/pkg/types"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/ktesting"
 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/features"
@@ -122,6 +124,64 @@ func makeContainer(id int) *container.Container {
 		ID:      container.ContainerID{Type: "test", ID: fmt.Sprintf("container-%d", id)},
 		Image:   imageName(id),
 		ImageID: imageID(id),
+	}
+}
+
+type imageVolumeRuntime struct {
+	*containertest.FakeRuntime
+	status *container.Status
+}
+
+func (r *imageVolumeRuntime) GetContainerStatus(context.Context, types.UID, container.ContainerID) (*container.Status, error) {
+	return r.status, nil
+}
+
+func TestImageVolumeRuntimeHandlerGC(t *testing.T) {
+	for _, gate := range []bool{false, true} {
+		for _, handler := range []string{"runc", "a", ""} {
+			t.Run(fmt.Sprintf("gate=%t/handler=%s", gate, handler), func(t *testing.T) {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RuntimeClassInImageCriAPI, gate)
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ImageVolume, true)
+				ctx := ktesting.Init(t)
+				manager, fakeRuntime := newRealImageGCManager(ImageGCPolicy{}, statstest.NewMockProvider(t))
+				fakeRuntime.ImageList = []container.Image{
+					makeImageWithRuntimeHandler(0, 1024, "runc"),
+					makeImageWithRuntimeHandler(1, 2048, "runc"),
+					makeImageWithRuntimeHandler(1, 2048, "a"),
+					makeImageWithRuntimeHandler(1, 2048, "b"),
+					makeImageWithRuntimeHandler(1, 2048, ""),
+				}
+				root := makeContainer(0)
+				root.ImageRuntimeHandler = "runc"
+				fakeRuntime.AllPodList = []*containertest.FakePod{{Pod: &container.Pod{Containers: []*container.Container{root}}}}
+				manager.runtime = &imageVolumeRuntime{FakeRuntime: fakeRuntime, status: &container.Status{Mounts: []container.Mount{
+					{Image: &runtimeapi.ImageSpec{Image: imageID(1), RuntimeHandler: handler}},
+				}}}
+				inUse, err := manager.detectImages(ctx, time.Now())
+				require.NoError(t, err)
+				for _, h := range []string{"runc", "a", "b", ""} {
+					key := imageID(1)
+					if gate {
+						key = getImageTuple(key, h)
+					}
+					used := !gate || handler == "" || h == "" || handler == h
+					assert.Equal(t, used, inUse.Has(key), h)
+					assert.Equal(t, used, !manager.imageRecords[key].lastUsed.IsZero(), h)
+				}
+				candidates, err := manager.imagesInEvictionOrder(ctx, time.Now())
+				require.NoError(t, err)
+				if !gate || handler == "" {
+					assert.Empty(t, candidates)
+				} else {
+					require.Len(t, candidates, 2)
+					for _, candidate := range candidates {
+						assert.Equal(t, imageID(1), candidate.id)
+						assert.NotEqual(t, handler, candidate.runtimeHandlerUsedToPullImage)
+						assert.NotEmpty(t, candidate.runtimeHandlerUsedToPullImage)
+					}
+				}
+			})
+		}
 	}
 }
 

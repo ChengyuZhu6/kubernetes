@@ -48,6 +48,8 @@ import (
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	"k8s.io/kubernetes/pkg/kubelet/logs"
+	"k8s.io/kubernetes/pkg/kubelet/runtimeclass"
+	rctest "k8s.io/kubernetes/pkg/kubelet/runtimeclass/testing"
 )
 
 // TestRemoveContainer tests removing the container and its corresponding container logs.
@@ -684,13 +686,38 @@ func testLifeCycleHook(t *testing.T, testPod *v1.Pod, testContainer *v1.Containe
 			},
 		}
 
-		// Now try to create a container, which should in turn invoke PostStart Hook
-		_, err := m.startContainer(tCtx, fakeSandBox.Id, fakeSandBoxConfig, containerStartSpec(testContainer), testPod, fakePodStatus, nil, "", []string{}, nil)
-		if err != nil {
-			t.Errorf("startContainer error =%v", err)
-		}
-		if fakeRunner.Cmd[0] != cmdPostStart.PostStart.Exec.Command[0] {
-			t.Errorf("CMD PostStart hook was not invoked")
+		m.runtimeClassManager = runtimeclass.NewManager(rctest.NewPopulatedClient())
+		defer rctest.StartManagerSync(m.runtimeClassManager)()
+		runtimeClassName := rctest.SandboxRuntimeClass
+		for _, test := range []struct {
+			name             string
+			gate             bool
+			runtimeClassName *string
+			expectedHandler  string
+		}{
+			{name: "gate-disabled", runtimeClassName: &runtimeClassName},
+			{name: "runtime-class", gate: true, runtimeClassName: &runtimeClassName, expectedHandler: rctest.SandboxRuntimeHandler},
+			{name: "default-runtime", gate: true},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				tCtx := ktesting.Init(t)
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RuntimeClassInImageCriAPI, test.gate)
+				pod := testPod.DeepCopy()
+				pod.Spec.RuntimeClassName = test.runtimeClassName
+				fakeRunner.Cmd = nil
+
+				// Now try to create a container, which should in turn invoke PostStart Hook
+				_, err := m.startContainer(tCtx, fakeSandBox.Id, fakeSandBoxConfig, containerStartSpec(testContainer), pod, fakePodStatus, nil, "", []string{}, nil)
+				require.NoError(t, err)
+				assert.Equal(t, cmdPostStart.PostStart.Exec.Command, fakeRunner.Cmd)
+				created := fakeRuntime.Containers[apitest.BuildContainerName(&runtimeapi.ContainerMetadata{Name: testContainer.Name, Attempt: 1}, fakeSandBox.Id)]
+				require.NotNil(t, created)
+				assert.Equal(t, &runtimeapi.ImageSpec{
+					Image:              "busybox:latest",
+					UserSpecifiedImage: testContainer.Image,
+					RuntimeHandler:     test.expectedHandler,
+				}, created.Image)
+			})
 		}
 	})
 }

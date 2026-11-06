@@ -273,6 +273,8 @@ func (m *kubeGenericRuntimeManager) startContainer(ctx context.Context, podSandb
 		return s.Message(), ErrCreateContainerConfig
 	}
 
+	containerConfig.Image.RuntimeHandler = podRuntimeHandler
+
 	// When creating a container, mark the resources as actuated.
 	if err := m.setActuatedContainerResources(logger, pod, container, spec.containerType); err != nil {
 		m.recordContainerEvent(ctx, pod, container, "", v1.EventTypeWarning, events.FailedToCreateContainer, "Error: %v", err)
